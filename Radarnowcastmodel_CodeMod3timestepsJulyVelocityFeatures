@@ -1,0 +1,236 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Apr 26 12:02:46 2025
+
+@author: admin
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Radar Nowcasting with U-Net - Improved Version
+Created on Apr 26, 2025
+@author: admin
+"""
+
+import numpy as np
+import xarray as xr
+import os
+import pandas as pd
+from skimage.transform import resize
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Conv2DTranspose, concatenate
+from tensorflow.keras.models import Model
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam
+import matplotlib.pyplot as plt
+import warnings
+import random
+
+# Suppress warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+warnings.filterwarnings("ignore")
+
+# Constants
+REFLECTIVITY_MAX = 70.0
+VELOCITY_SCALE = 60.0   # 🔵 Changed to 60 for better scaling
+TARGET_SHAPE = (128, 128)
+TIME_HORIZON = 10
+SEQUENCE_LENGTH = 1
+LEARNING_RATE = 0.00043
+NUM_FILTERS = 64
+
+# Processing functions
+def process_reflectivity(data):
+    data = np.nan_to_num(data, nan=0.0)
+    return np.clip(data, 0, REFLECTIVITY_MAX)
+
+def process_velocity(vel_data):
+    return np.nan_to_num(vel_data, nan=0.0)
+
+def compute_velocity_magnitude(vel):
+    return np.abs(vel)
+
+def compute_velocity_divergence(vel):
+    grad_x = np.gradient(vel, axis=-2)
+    grad_y = np.gradient(vel, axis=-1)
+    return grad_x + grad_y
+
+def load_and_process_sequence(folder_path):
+    all_datasets = []
+    for day in range(1, 32):
+        file = f"2023JUL{day:02d}_combined.nc"
+        fpath = os.path.join(folder_path, file)
+        if os.path.exists(fpath):
+            all_datasets.append(xr.open_dataset(fpath))
+    
+    full_ds = xr.concat(all_datasets, dim="time")
+    ref = process_reflectivity(full_ds['Reflectivity_Horizontal'].values)
+    vel = process_velocity(full_ds['Horizontal_Velocity'].values)
+    times = pd.to_datetime(full_ds['time'].values)
+
+    num_samples = ref.shape[0] - SEQUENCE_LENGTH - TIME_HORIZON + 1
+    num_elev = ref.shape[1]
+
+    X = np.zeros((num_samples, *TARGET_SHAPE, 4 * num_elev), dtype=np.float32)
+    Y = np.zeros((num_samples, *TARGET_SHAPE, TIME_HORIZON), dtype=np.float32)
+
+    input_times, future_times = [], []
+
+    for i in range(num_samples):
+        for elev in range(num_elev):
+            ref_input = resize(ref[i, elev], TARGET_SHAPE, preserve_range=True)
+            vel_input = resize(vel[i, elev], TARGET_SHAPE, preserve_range=True)
+            vel_mag = compute_velocity_magnitude(vel_input)
+            vel_div = compute_velocity_divergence(vel_input)
+
+            X[i, ..., elev] = ref_input
+            X[i, ..., num_elev + elev] = vel_input
+            X[i, ..., 2*num_elev + elev] = vel_mag
+            X[i, ..., 3*num_elev + elev] = vel_div
+
+        for t in range(TIME_HORIZON):
+            max_future = np.max(ref[i + SEQUENCE_LENGTH + t], axis=0)
+            Y[i, ..., t] = resize(max_future, TARGET_SHAPE, preserve_range=True)
+
+        input_times.append(times[i])
+        future_times.append(times[i + SEQUENCE_LENGTH + TIME_HORIZON - 1])
+
+    X[..., :num_elev] = (X[..., :num_elev] - REFLECTIVITY_MAX/2) / (REFLECTIVITY_MAX/3)
+    X[..., num_elev:] /= VELOCITY_SCALE
+    Y = (Y - REFLECTIVITY_MAX/2) / (REFLECTIVITY_MAX/3)
+
+    input_times = pd.to_datetime(input_times)
+    future_times = pd.to_datetime(future_times)
+
+    train_mask = (input_times >= "2023-07-01") & (input_times <= "2023-07-20")
+    val_mask   = (input_times > "2023-07-20") & (input_times <= "2023-07-23")
+    test_mask  = (input_times > "2023-07-23") & (input_times <= "2023-07-25")
+
+    return (X[train_mask], Y[train_mask],
+            X[val_mask],  Y[val_mask],
+            X[test_mask], Y[test_mask],
+            REFLECTIVITY_MAX/2, REFLECTIVITY_MAX/3,
+            input_times[test_mask], future_times[test_mask])
+
+# UNet Model
+def create_unet_model(input_shape, output_timesteps, num_filters):
+    inputs = Input(shape=input_shape)
+    c1 = Conv2D(num_filters, (3, 3), activation='relu', padding='same')(inputs)
+    c1 = Conv2D(num_filters, (3, 3), activation='relu', padding='same')(c1)
+    p1 = MaxPooling2D((2, 2))(c1)
+
+    c2 = Conv2D(num_filters*2, (3, 3), activation='relu', padding='same')(p1)
+    c2 = Conv2D(num_filters*2, (3, 3), activation='relu', padding='same')(c2)
+    p2 = MaxPooling2D((2, 2))(c2)
+
+    bn = Conv2D(num_filters*4, (3, 3), activation='relu', padding='same')(p2)
+    bn = Conv2D(num_filters*4, (3, 3), activation='relu', padding='same')(bn)
+
+    u1 = Conv2DTranspose(num_filters*2, (3, 3), strides=(2, 2), padding='same')(bn)
+    u1 = concatenate([u1, c2])
+    c3 = Conv2D(num_filters*2, (3, 3), activation='relu', padding='same')(u1)
+    c3 = Conv2D(num_filters*2, (3, 3), activation='relu', padding='same')(c3)
+
+    u2 = Conv2DTranspose(num_filters, (3, 3), strides=(2, 2), padding='same')(c3)
+    u2 = concatenate([u2, c1])
+    c4 = Conv2D(num_filters, (3, 3), activation='relu', padding='same')(u2)
+    c4 = Conv2D(num_filters, (3, 3), activation='relu', padding='same')(c4)
+
+    outputs = Conv2D(output_timesteps, (3, 3), activation='linear', padding='same')(c4)
+    return Model(inputs, outputs)
+
+# History Plot
+def plot_history(history):
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Val Loss')
+    plt.title('Loss over Epochs', fontsize=14)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('MSE', fontsize=12)
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['mae'], label='Train MAE')
+    plt.plot(history.history['val_mae'], label='Val MAE')
+    plt.title('MAE over Epochs', fontsize=14)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('MAE', fontsize=12)
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig("training_history.png")
+    plt.show()
+
+# Main
+
+def main():
+    folder_path = "D:/Processed_Radar_Data/2023/July"
+    X_train, Y_train, X_val, Y_val, X_test, Y_test, mean, std, t_input, t_future = load_and_process_sequence(folder_path)
+
+    print(f"Train shape: {X_train.shape}, Validation: {X_val.shape}, Test: {X_test.shape}")
+
+    model = create_unet_model(X_train.shape[1:], output_timesteps=TIME_HORIZON, num_filters=NUM_FILTERS)
+    model.compile(optimizer=Adam(learning_rate=LEARNING_RATE), loss='mse', metrics=['mae'])
+
+    callbacks = [
+        EarlyStopping(patience=8, restore_best_weights=True),
+        ModelCheckpoint("best_model.h5", save_best_only=True),
+        ReduceLROnPlateau(factor=0.2, patience=5)
+    ]
+
+    history = model.fit(X_train, Y_train,
+                        validation_data=(X_val, Y_val),
+                        epochs=50,
+                        batch_size=8,
+                        callbacks=callbacks)
+
+    plot_history(history)
+
+    model.evaluate(X_test, Y_test)
+
+    # Plot Test Predictions
+    vmin, vmax = 0, 70
+
+    for idx in random.sample(range(len(X_test)), 3):
+        input_ref = X_test[idx][..., :X_test.shape[-1]//4] * (REFLECTIVITY_MAX/3) + (REFLECTIVITY_MAX/2)
+        input_plot = np.max(input_ref, axis=-1)
+
+        pred = model.predict(X_test[idx:idx+1])[0]
+        true = Y_test[idx]
+
+        pred = pred[..., -1] * std + mean
+        true = true[..., -1] * std + mean
+        error = pred - true
+
+        t0 = t_input[idx].strftime('%Y-%m-%d %H:%M')
+        t10 = t_future[idx].strftime('%Y-%m-%d %H:%M')
+
+        fig, axes = plt.subplots(1, 4, figsize=(22, 6))
+        fig.suptitle(f"Nowcasting T={t0} to T+10={t10}", fontsize=16)
+
+        im0 = axes[0].imshow(input_plot, cmap='Blues', vmin=vmin, vmax=vmax)
+        axes[0].set_title("Input Reflectivity", fontsize=14)
+        plt.colorbar(im0, ax=axes[0])
+
+        im1 = axes[1].imshow(true, cmap='coolwarm', vmin=vmin, vmax=vmax)
+        axes[1].set_title("Actual Reflectivity", fontsize=14)
+        plt.colorbar(im1, ax=axes[1])
+
+        im2 = axes[2].imshow(pred, cmap='coolwarm', vmin=vmin, vmax=vmax)
+        axes[2].set_title("Predicted Reflectivity", fontsize=14)
+        plt.colorbar(im2, ax=axes[2])
+
+        im3 = axes[3].imshow(error, cmap='seismic', vmin=-20, vmax=20)
+        axes[3].set_title("Prediction Error", fontsize=14)
+        plt.colorbar(im3, ax=axes[3])
+
+        for ax in axes:
+            ax.axis('off')
+
+        plt.tight_layout(rect=[0, 0, 1, 0.93])
+        plt.savefig(f"sample_prediction_{idx}.png")
+        plt.show()
+
+if __name__ == "__main__":
+    main()
